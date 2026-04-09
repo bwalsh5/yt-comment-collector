@@ -139,17 +139,21 @@ class YouTubeCommentCollector:
         return videos[:max_results]
 
     def get_comments(self, video_id: str, max_comments: int = 0) -> list:
-        """Fetch comments for a video. max_comments=0 means collect all available."""
+        """Fetch top-level comments and replies for a video. max_comments=0 means collect all available."""
         comments = []
         unlimited = max_comments == 0
+
+        def _at_limit():
+            return not unlimited and len(comments) >= max_comments
+
         try:
             next_page_token = None
-            while True:
+            while not _at_limit():
                 fetch = 100 if unlimited else min(100, max_comments - len(comments))
                 resp = (
                     self.youtube.commentThreads()
                     .list(
-                        part="snippet",
+                        part="snippet,replies",
                         videoId=video_id,
                         maxResults=fetch,
                         pageToken=next_page_token,
@@ -158,6 +162,10 @@ class YouTubeCommentCollector:
                     .execute()
                 )
                 for item in resp["items"]:
+                    if _at_limit():
+                        break
+
+                    # Top-level comment
                     c = item["snippet"]["topLevelComment"]["snippet"]
                     comments.append(
                         {
@@ -167,10 +175,60 @@ class YouTubeCommentCollector:
                             "likes": c["likeCount"],
                         }
                     )
+
+                    # Replies
+                    total_replies = item["snippet"].get("totalReplyCount", 0)
+                    if total_replies > 0 and not _at_limit():
+                        thread_id = item["id"]
+                        embedded = item.get("replies", {}).get("comments", [])
+
+                        if len(embedded) >= total_replies:
+                            # All replies already embedded in the response
+                            for rc in embedded:
+                                if _at_limit():
+                                    break
+                                rs = rc["snippet"]
+                                comments.append(
+                                    {
+                                        "text": rs["textDisplay"],
+                                        "author": rs["authorDisplayName"],
+                                        "date": rs["publishedAt"],
+                                        "likes": rs["likeCount"],
+                                    }
+                                )
+                        else:
+                            # Fetch replies via separate paginated call
+                            reply_page_token = None
+                            while not _at_limit():
+                                reply_resp = (
+                                    self.youtube.comments()
+                                    .list(
+                                        part="snippet",
+                                        parentId=thread_id,
+                                        maxResults=100,
+                                        pageToken=reply_page_token,
+                                        textFormat="plainText",
+                                    )
+                                    .execute()
+                                )
+                                for rc in reply_resp["items"]:
+                                    if _at_limit():
+                                        break
+                                    rs = rc["snippet"]
+                                    comments.append(
+                                        {
+                                            "text": rs["textDisplay"],
+                                            "author": rs["authorDisplayName"],
+                                            "date": rs["publishedAt"],
+                                            "likes": rs["likeCount"],
+                                        }
+                                    )
+                                reply_page_token = reply_resp.get("nextPageToken")
+                                if not reply_page_token:
+                                    break
+
                 next_page_token = resp.get("nextPageToken")
                 if not next_page_token:
-                    break
-                if not unlimited and len(comments) >= max_comments:
                     break
 
         except HttpError as e:
